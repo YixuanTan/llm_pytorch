@@ -23,6 +23,6 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x, use_kv_cache=False):
-        x = x + self.attn(self.ln1(x), use_kv_cache=use_kv_cache)
+        x = x + self.attn(self.ln1(x))
         x = x + self.mlp(self.ln2(x))
         return x
