@@ -1,3 +1,6 @@
+from typing import Any
+
+
 import torch 
 from torch.utils.data import Dataset, DataLoader
 
@@ -31,8 +34,8 @@ class CharDataset(Dataset):
         return x, y
 
 def create_dataloader(text, block_size, batch_size):
-    tokenizer =CharTokenizer(text)
+    tokenizer = CharTokenizer(text)
     dataset = CharDataset(text, block_size, tokenizer)
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    loader = DataLoader[Any](dataset, batch_size=batch_size, shuffle=True)
     return loader, tokenizer
 
