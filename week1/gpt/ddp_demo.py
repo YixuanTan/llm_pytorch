@@ -1,3 +1,6 @@
+""" To run:
+torchrun --standalone --nproc_per_node=2 ddp_demo.py
+"""
 import os
 import torch
 import torch.nn as nn
