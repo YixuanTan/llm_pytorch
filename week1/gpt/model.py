@@ -43,7 +43,7 @@ class GPT(nn.Module):
         x = self.drop(x)
 
         for block in self.blocks:
-            x = block(x, use_kv_cache=use_kv_cache)
+            x = block(x, use_kv_cache=use_kv_cache, past_length=past_length)
 
         x = self.ln_f(x)
         logits = self.head(x)

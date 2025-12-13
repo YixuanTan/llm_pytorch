@@ -23,7 +23,7 @@ class MultiHeadAttention(nn.Module):
         self.key_cache = None
         self.value_cache = None
 
-    def forward(self, x, use_kv_cache=False):
+    def forward(self, x, use_kv_cache=False, past_length=0):
         B, T, C = x.shape
 
         q = self.q_proj(x)
@@ -38,14 +38,21 @@ class MultiHeadAttention(nn.Module):
         if use_kv_cache:
             cached_k = k.detach()
             cached_v = v.detach()
+            cached_k = k.detach()
+            cached_v = v.detach()
             if self.key_cache is None:
+                self.key_cache = cached_k
+                self.value_cache = cached_v
                 self.key_cache = cached_k
                 self.value_cache = cached_v
             else:
                 self.key_cache = torch.cat([self.key_cache, cached_k], dim=2)
                 self.value_cache = torch.cat([self.value_cache, cached_v], dim=2)
+                self.key_cache = torch.cat([self.key_cache, cached_k], dim=2)
+                self.value_cache = torch.cat([self.value_cache, cached_v], dim=2)
 
             k_all = self.key_cache
+            v_all = self.value_cache
             v_all = self.value_cache
             T_k = k_all.size(2)
         else:
@@ -53,9 +60,12 @@ class MultiHeadAttention(nn.Module):
             v_all = v
             T_k = T
             self.reset_kv_cache()
+            self.reset_kv_cache()
 
         att = torch.matmul(q, k_all.transpose(-2, -1)) / (d_h ** 0.5)
-        mask = torch.tril(torch.ones(T, T_k, device=x.device, dtype=torch.bool))
+        key_positions = torch.arange(T_k, device=x.device)
+        query_positions = torch.arange(past_length, past_length + T, device=x.device)
+        mask = query_positions.unsqueeze(1) >= key_positions.unsqueeze(0)
         att = att.masked_fill(~mask, float("-inf"))
         att = F.softmax(att, dim=-1)
         out = torch.matmul(att, v_all)
