@@ -38,20 +38,28 @@ class MultiHeadAttention(nn.Module):
         if use_kv_cache:
             cached_k = k.detach()
             cached_v = v.detach()
+            cached_k = k.detach()
+            cached_v = v.detach()
             if self.key_cache is None:
+                self.key_cache = cached_k
+                self.value_cache = cached_v
                 self.key_cache = cached_k
                 self.value_cache = cached_v
             else:
                 self.key_cache = torch.cat([self.key_cache, cached_k], dim=2)
                 self.value_cache = torch.cat([self.value_cache, cached_v], dim=2)
+                self.key_cache = torch.cat([self.key_cache, cached_k], dim=2)
+                self.value_cache = torch.cat([self.value_cache, cached_v], dim=2)
 
             k_all = self.key_cache
+            v_all = self.value_cache
             v_all = self.value_cache
             T_k = k_all.size(2)
         else:
             k_all = k
             v_all = v
             T_k = T
+            self.reset_kv_cache()
             self.reset_kv_cache()
 
         att = torch.matmul(q, k_all.transpose(-2, -1)) / (d_h ** 0.5)
