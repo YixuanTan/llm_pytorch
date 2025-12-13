@@ -19,6 +19,10 @@ class MultiHeadAttention(nn.Module):
         self.register_buffer("key_cache", None, persistent=False)
         self.register_buffer("value_cache", None, persistent=False)
 
+    def reset_kv_cache(self):
+        self.key_cache = None
+        self.value_cache = None
+
     def forward(self, x, use_kv_cache=False):
         B, T, C = x.shape
 
@@ -32,26 +36,27 @@ class MultiHeadAttention(nn.Module):
         v = v.view(B, T, self.config.n_head, d_h).transpose(1,2)
 
         if use_kv_cache:
+            cached_k = k.detach()
+            cached_v = v.detach()
             if self.key_cache is None:
-                self.key_cache = k
-                self.value_cache = v
+                self.key_cache = cached_k
+                self.value_cache = cached_v
             else:
-                self.key_cache = torch.cat([self.key_cache, k], dim=2)
-                self.value_cache = torch.cat([self.value_cache, v], dim=2)
+                self.key_cache = torch.cat([self.key_cache, cached_k], dim=2)
+                self.value_cache = torch.cat([self.value_cache, cached_v], dim=2)
 
             k_all = self.key_cache
-            v_all = self.value_cahce
+            v_all = self.value_cache
             T_k = k_all.size(2)
-
         else:
             k_all = k
             v_all = v
             T_k = T
+            self.reset_kv_cache()
 
-        # scaled dot-product attention
         att = torch.matmul(q, k_all.transpose(-2, -1)) / (d_h ** 0.5)
-        mask = torch.tril(torch.ones(T, T_k, device=x.device))
-        att = att.masked_fill(mask==0, float("-inf"))
+        mask = torch.tril(torch.ones(T, T_k, device=x.device, dtype=torch.bool))
+        att = att.masked_fill(~mask, float("-inf"))
         att = F.softmax(att, dim=-1)
         out = torch.matmul(att, v_all)
 
