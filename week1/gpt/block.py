@@ -22,7 +22,10 @@ class Block(nn.Module):
         self.ln2 = nn.LayerNorm(config.n_embd)
         self.mlp = MLP(config)
 
-    def forward(self, x, use_kv_cache=False):
-        x = x + self.attn(self.ln1(x))
+    def forward(self, x, use_kv_cache=False, past_length=0):
+        x = x + self.attn(self.ln1(x), use_kv_cache=use_kv_cache, past_length=past_length)
         x = x + self.mlp(self.ln2(x))
         return x
+
+    def reset_kv_cache(self):
+        self.attn.reset_kv_cache()

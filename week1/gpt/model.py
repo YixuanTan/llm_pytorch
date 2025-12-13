@@ -12,7 +12,6 @@ class GPT(nn.Module):
 
         self.wte = nn.Embedding(config.vocab_size, config.n_embd)
         self.wpe = nn.Embedding(config.block_size, config.n_embd)
-
         self.drop = nn.Dropout(config.dropout)
         self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
 
@@ -30,11 +29,11 @@ class GPT(nn.Module):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
 
-    def forward(self, idx, use_kv_cache=False):
+    def forward(self, idx, use_kv_cache=False, past_length=0):
         B, T = idx.size()
 
         device = idx.device
-        pos = torch.arange(T, device=device)
+        pos = torch.arange(past_length, past_length + T, device=device)
 
         tok_emb = self.wte(idx)
         pos_emb = self.wpe(pos)
@@ -44,9 +43,13 @@ class GPT(nn.Module):
         x = self.drop(x)
 
         for block in self.blocks:
-            x = block(x, use_kv_cache=use_kv_cache)
+            x = block(x, use_kv_cache=use_kv_cache, past_length=past_length)
 
         x = self.ln_f(x)
         logits = self.head(x)
 
         return logits
+
+    def reset_kv_cache(self):
+        for block in self.blocks:
+            block.reset_kv_cache()
