@@ -1,6 +1,5 @@
 import torch
 
-
 @torch.no_grad()
 def generate(model, idx, max_new_tokens):
     model.eval()
