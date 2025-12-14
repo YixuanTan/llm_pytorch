@@ -49,7 +49,7 @@ for epoch in range(10):
         x = x.to(device)
         y = y.to(device)
 
-        logits = model(x, y)
+        logits = model(x)
         loss = F.cross_entropy(logits[:, :-1].reshape(-1, config.vocab_size), x[:, 1:].reshape(-1))
 
         optimizer.zero_grad()
@@ -71,11 +71,14 @@ with torch.no_grad():
     prompt = x[0:1, :16]
     out_ids = prompt.clone()
 
+    model.reset_kv_cache()
+    logits = model(out_ids, use_kv_cache=True)
     for _ in range(32):
-        logits = model(out_ids)
         next_token_logits = logits[:, -1, :]
         next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
         out_ids = torch.cat([out_ids, next_token], dim=1)
+        past_length = out_ids.size(1) - 1
+        logits = model(out_ids[:, -1:], use_kv_cache=True, past_length=past_length)
 
     generated = tokenizer.decode(out_ids[0].cpu().tolist())
     print("========= Generated sample =====")
