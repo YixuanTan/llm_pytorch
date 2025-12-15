@@ -1,6 +1,7 @@
 import os
+import sys
+from pathlib import Path
 import torch
-from torch.cpu import is_initialized
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -10,11 +11,17 @@ from torch.distributed.fsdp import(
     BackwardPrefetch,
     ShardingStrategy,
 )
+from torch.distributed.fsdp import StateDictType, FullStateDictConfig
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 
 from torch.utils.data import DataLoader, DistributedSampler
 import torch.optim as optim
 import torch.nn.functional as F
+
+# Ensure project root is on sys.path for relative imports
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from week1.gpt.config import GPTConfig
 from week1.gpt.model import GPT, Block
@@ -45,11 +52,17 @@ def cleanup_distributed():
 
 
 def build_fsdp_model(config: GPTConfig, device, mp_dtype=torch.bfloat16):
-    torch.manual_see(42)
+    torch.manual_seed(42)
     model = GPT(config).to(device)
 
-    # auto_wrap_policy: only wrap Tranformer Block, embedding 
-    auto_wrap_policy = transformer_auto_wrap_policy(transformer_layer_cls={Block},)
+    # auto_wrap_policy: only wrap Transformer Blocks and embeddings
+    def auto_wrap_policy(module, recurse, nonwrapped_numel):
+        return transformer_auto_wrap_policy(
+            module=module,
+            recurse=recurse,
+            nonwrapped_numel=nonwrapped_numel,
+            transformer_layer_cls={Block},
+        )
 
     mp_policy = MixedPrecision(
         param_dtype=mp_dtype,
@@ -123,8 +136,8 @@ def train_one_epoch(model, dataloader, optimizer, device, rank, sampler=None, ma
         optimizer.step()
 
         total_loss += loss.item()
-        if step % 10 == 0 and rank == 0:
-            print(f"[rank {rank}] step {step}, loss={loss.item():.4f}")
+        # if step % 10 == 0 and rank == 0:
+        print(f"[rank {rank}] step {step}, loss={loss.item():.4f}")
         
         step += 1
         if max_steps is not None and step >= max_steps:
@@ -189,12 +202,18 @@ train_one_epoch(
     max_steps=50,
 )
 
-# 保存 checkpoint（只在 rank 0）
-if rank == 0:
-    # 使用 FSDP 的 state_dict hook（use_orig_params=True 时更简单）
+# 保存 checkpoint（只在 rank 0），但所有 rank 参与 FULL_STATE_DICT 的 all_gather。
+dist.barrier()
+with FSDP.state_dict_type(
+    fsdp_model,
+    StateDictType.FULL_STATE_DICT,
+    FullStateDictConfig(offload_to_cpu=True, rank0_only=True),
+):
     cpu_state = fsdp_model.state_dict()
-    os.makedirs("checkpoints_fsdp", exist_ok=True)
-    torch.save(cpu_state, "checkpoints_fsdp/gpt_fsdp_rank0.pt")
-    print("[rank 0] checkpoint saved.")
+    if rank == 0:
+        os.makedirs("checkpoints_fsdp", exist_ok=True)
+        torch.save(cpu_state, "checkpoints_fsdp/gpt_fsdp_rank0.pt")
+        print("[rank 0] checkpoint saved.")
+dist.barrier()
 
 cleanup_distributed()
