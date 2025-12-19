@@ -67,7 +67,7 @@ class MultiHeadAttention(nn.Module):
 
 
         if self.use_flash:
-            y = F.scaaled_dot_product_attention(
+            y = F.scaled_dot_product_attention(
                 q, k, v,
                 attn_mask = None,
                 dropout_p = self.dropout if self.training else 0.0,
