@@ -5,15 +5,18 @@ import torch.nn.functional as F
 from week1.gpt.config import GPTConfig
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, config: GPTConfig):
+    def __init__(self, config: GPTConfig, use_flash: bool = True):
         super().__init__()
         self.config = config
         self.head_dim = config.n_embd // config.n_head
+        self.use_flash = use_flash
 
         self.q_proj = nn.Linear(config.n_embd, config.n_embd)
         self.k_proj = nn.Linear(config.n_embd, config.n_embd)
         self.v_proj = nn.Linear(config.n_embd, config.n_embd)
         self.out_proj = nn.Linear(config.n_embd, config.n_embd)
+
+        self.dropout = config.dropout
 
         # KV cache
         self.register_buffer("key_cache", None, persistent=False)
@@ -62,13 +65,22 @@ class MultiHeadAttention(nn.Module):
             self.reset_kv_cache()
             self.reset_kv_cache()
 
-        att = torch.matmul(q, k_all.transpose(-2, -1)) / (d_h ** 0.5)
-        key_positions = torch.arange(T_k, device=x.device)
-        query_positions = torch.arange(past_length, past_length + T, device=x.device)
-        mask = query_positions.unsqueeze(1) >= key_positions.unsqueeze(0)
-        att = att.masked_fill(~mask, float("-inf"))
-        att = F.softmax(att, dim=-1)
-        out = torch.matmul(att, v_all)
+
+        if self.use_flash:
+            y = F.scaaled_dot_product_attention(
+                q, k, v,
+                attn_mask = None,
+                dropout_p = self.dropout if self.training else 0.0,
+                is_causal = True,
+            )
+        else:
+            att = torch.matmul(q, k_all.transpose(-2, -1)) / (d_h ** 0.5)
+            key_positions = torch.arange(T_k, device=x.device)
+            query_positions = torch.arange(past_length, past_length + T, device=x.device)
+            mask = query_positions.unsqueeze(1) >= key_positions.unsqueeze(0)
+            att = att.masked_fill(~mask, float("-inf"))
+            att = F.softmax(att, dim=-1)
+            out = torch.matmul(att, v_all)
 
         out = out.transpose(1,2).contiguous().view(B, T, C)
         return self.out_proj(out)

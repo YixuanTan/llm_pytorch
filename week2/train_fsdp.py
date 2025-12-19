@@ -137,7 +137,7 @@ def train_one_epoch(model, dataloader, optimizer, device, rank, sampler=None, ma
 
         total_loss += loss.item()
         # if step % 10 == 0 and rank == 0:
-        print(f"[rank {rank}] step {step}, loss={loss.item():.4f}")
+            print(f"[rank {rank}] step {step}, loss={loss.item():.4f}")
         
         step += 1
         if max_steps is not None and step >= max_steps:
@@ -211,9 +211,9 @@ with FSDP.state_dict_type(
 ):
     cpu_state = fsdp_model.state_dict()
     if rank == 0:
-        os.makedirs("checkpoints_fsdp", exist_ok=True)
-        torch.save(cpu_state, "checkpoints_fsdp/gpt_fsdp_rank0.pt")
-        print("[rank 0] checkpoint saved.")
+    os.makedirs("checkpoints_fsdp", exist_ok=True)
+    torch.save(cpu_state, "checkpoints_fsdp/gpt_fsdp_rank0.pt")
+    print("[rank 0] checkpoint saved.")
 dist.barrier()
 
 cleanup_distributed()
