@@ -198,9 +198,11 @@ And by opposing end them.
 
     # 保存 checkpoint（只在 rank 0），但所有 rank 参与 FULL_STATE_DICT 的 all_gather。
     if is_dist:
+        print("sync all ranks")
         dist.barrier()
     # save checkpoint (rank 0 only)
     if rank == 0:
+        print("saving checkpoint")
         state = fsdp_model.state_dict()
         os.makedirs("ckpt_fsdp_amp", exist_ok=True)
         torch.save(state, "ckpt_fsdp_amp/model.pt")
