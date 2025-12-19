@@ -136,9 +136,9 @@ def train_one_epoch(model, dataloader, optimizer, device, rank, sampler=None, ma
         optimizer.step()
 
         total_loss += loss.item()
-        # if step % 10 == 0 and rank == 0:
+        if step % 10 == 0 and rank == 0:
             print(f"[rank {rank}] step {step}, loss={loss.item():.4f}")
-        
+
         step += 1
         if max_steps is not None and step >= max_steps:
             break
@@ -203,7 +203,9 @@ train_one_epoch(
 )
 
 # 保存 checkpoint（只在 rank 0），但所有 rank 参与 FULL_STATE_DICT 的 all_gather。
-dist.barrier()
+if is_distributed:
+    dist.barrier()
+
 with FSDP.state_dict_type(
     fsdp_model,
     StateDictType.FULL_STATE_DICT,
@@ -211,9 +213,11 @@ with FSDP.state_dict_type(
 ):
     cpu_state = fsdp_model.state_dict()
     if rank == 0:
-    os.makedirs("checkpoints_fsdp", exist_ok=True)
-    torch.save(cpu_state, "checkpoints_fsdp/gpt_fsdp_rank0.pt")
-    print("[rank 0] checkpoint saved.")
-dist.barrier()
+        os.makedirs("checkpoints_fsdp", exist_ok=True)
+        torch.save(cpu_state, "checkpoints_fsdp/gpt_fsdp_rank0.pt")
+        print("[rank 0] checkpoint saved.")
+
+if is_distributed:
+    dist.barrier()
 
 cleanup_distributed()
