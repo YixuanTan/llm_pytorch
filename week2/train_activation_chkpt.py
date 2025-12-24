@@ -1,8 +1,6 @@
 import os
 import sys
 from pathlib import Path
-from tabnanny import check
-from sympy import checkpdesol
 import torch
 import torch.distributed as dist
 from torch.distributed import fsdp
@@ -157,7 +155,7 @@ def apply_ac_to_blocks(fsdp_model):
 
     wrapper_fn = lambda m: checkpoint_wrapper(
         m,
-        checkpdesol_impl=CheckpointImpl.NO_REENTRANT
+        checkpoint_impl=CheckpointImpl.NO_REENTRANT
     )
 
     apply_activation_checkpointing(
@@ -227,21 +225,33 @@ And by opposing end them.
     if rank == 0:
         print(f"[rank0] peak mem={peak:.2f} MB")
 
-    # 保存 checkpoint（只在 rank 0），但所有 rank 参与 FULL_STATE_DICT 的 all_gather。
+    # 保存 checkpoint：所有 rank 都必须调用 state_dict()（集体操作），但只有 rank 0 保存到磁盘
     if is_dist:
-        print("sync all ranks")
+        if rank == 0:
+            print("sync all ranks for checkpoint")
         dist.barrier()
-    # save checkpoint (rank 0 only)
-    if rank == 0:
-        print("saving checkpoint")
+        
+        # All ranks must call state_dict() (collective operation)
+        if rank == 0:
+            print("saving checkpoint (all ranks participate in state_dict)")
         state = fsdp_model.state_dict()
-        os.makedirs("ckpt_fsdp_amp", exist_ok=True)
-        torch.save(state, "ckpt_fsdp_amp/model.pt")
-        print("Checkpoint saved.")
-
-    if is_dist:
+        
+        # Only rank 0 saves to disk
+        if rank == 0:
+            os.makedirs("ckpt_fsdp_amp", exist_ok=True)
+            torch.save(state, "ckpt_fsdp_amp/model.pt")
+            print("Checkpoint saved.")
+        
         dist.barrier()
         dist.destroy_process_group()
+    else:
+        # Single process: just save normally
+        if rank == 0:
+            print("saving checkpoint")
+            state = fsdp_model.state_dict()
+            os.makedirs("ckpt_fsdp_amp", exist_ok=True)
+            torch.save(state, "ckpt_fsdp_amp/model.pt")
+            print("Checkpoint saved.")
 
 
 if __name__ == "__main__":
