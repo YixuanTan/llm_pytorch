@@ -54,11 +54,18 @@ def build_fsdp(model: torch.nn.Module, use_bf16: bool, act_ckpt: bool):
             buffer_dtype=torch.bfloat16,
         )
     # FSDP 自动wrap 每个transformer Block
-    auto_wrap = transformer_auto_wrap_policy({Block})
+    # transformer_auto_wrap_policy is a partial function factory
+    def auto_wrap_policy(module, recurse, nonwrapped_numel):
+        return transformer_auto_wrap_policy(
+            module=module,
+            recurse=recurse,
+            nonwrapped_numel=nonwrapped_numel,
+            transformer_layer_cls={Block},
+        )
 
     fsdp = FSDP(
         model,
-        auto_wrap_policy=auto_wrap,
+        auto_wrap_policy=auto_wrap_policy,
         sharding_strategy=ShardingStrategy.FULL_SHARD,
         mixed_precision=mp,
         backward_prefetch=BackwardPrefetch.BACKWARD_PRE,

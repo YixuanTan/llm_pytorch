@@ -1,224 +1,162 @@
+"""
+Dataset classes for pretraining
+"""
 import os
-import argparse
+import numpy as np
 import torch
-import torch.distributed as dist
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import Dataset
 
-from torch.distributed.fsdp import (
-    FullyShardedDataParallel as FSDP,
-    MixedPrecision,
-    ShardingStrategy,
-    BackwardPrefetch,
-)
-from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
-from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
-    checkpoint_wrapper,
-    CheckpointImpl,
-    apply_activation_checkpointing,
-)
 
-from model import ModelConfig, TransformerLM, Block
-from data import RandomTokenDataset, MemmapTokenDataset
-from utils import rank0, all_reduce_mean, count_params, ThroughputMeter, cosine_lr
+class RandomTokenDataset(Dataset):
+    """
+    Generate random tokens on-the-fly for testing/debugging purposes.
+    Useful for benchmarking without real data.
+    """
+    def __init__(self, num_tokens: int, seq_len: int, vocab_size: int, seed: int = 42):
+        """
+        Args:
+            num_tokens: Total number of tokens in the dataset
+            seq_len: Sequence length for each sample
+            vocab_size: Vocabulary size
+            seed: Random seed for reproducibility
+        """
+        self.num_tokens = num_tokens
+        self.seq_len = seq_len
+        self.vocab_size = vocab_size
+        self.seed = seed
+        
+        # Number of samples = total_tokens / seq_len
+        self.num_samples = num_tokens // seq_len
+        
+    def __len__(self):
+        return self.num_samples
+    
+    def __getitem__(self, idx):
+        """
+        Returns (x, y) where y is x shifted by 1 position
+        """
+        # Use idx as part of seed for reproducibility
+        rng = np.random.default_rng(seed=self.seed + idx)
+        
+        # Generate random tokens
+        tokens = rng.integers(0, self.vocab_size, size=self.seq_len + 1, dtype=np.int64)
+        
+        x = torch.from_numpy(tokens[:-1].copy())  # input: [0, seq_len-1]
+        y = torch.from_numpy(tokens[1:].copy())   # target: [1, seq_len]
+        
+        return x, y
 
-def setup_distributed():
-    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
-        dist.init_process_group(backend="nccl", init_method="env://")
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        torch.cuda.set_device(local_rank)
-        return True, local_rank
-    return False, 0
 
-def get_model_cfg(preset: str, vocab_size: int, seq_len: int, flash: bool, act_ckpt: bool):
-    if preset == "8m":
-        cfg = ModelConfig(vocab_size=vocab_size, max_seq_len=seq_len, 
-                          n_layers=4, n_heads=4, d_model=256, d_ff=1024, use_flash=flash, activation_checkpointing=act_ckpt)
-    elif preset == "100m":
-        cfg = ModelConfig(vocab_size=vocab_size, max_seq_len=seq_len,
-                          n_layers=12, n_heads=12, d_model=768, d_ff=3072,
-                          use_flash=flash, activation_checkpointing=act_ckpt)
-    elif preset == "300m":
-        cfg = ModelConfig(vocab_size=vocab_size, max_seq_len=seq_len,
-                          n_layers=24, n_heads=16, d_model=1024, d_ff=4096,
-                          use_flash=flash, activation_checkpointing=act_ckpt)
-    else:
-        raise ValueError(f"unknown preset: {preset}")
-    return cfg
+class MemmapTokenDataset(Dataset):
+    """
+    Load pre-tokenized data from a memory-mapped binary file.
+    Efficient for large datasets that don't fit in memory.
+    
+    Expected format: binary file with tokens stored as uint16 or uint32.
+    """
+    def __init__(self, bin_path: str, seq_len: int, vocab_size: int, dtype: str = "uint16"):
+        """
+        Args:
+            bin_path: Path to the binary file containing tokens
+            seq_len: Sequence length for each sample
+            vocab_size: Vocabulary size (for validation)
+            dtype: Data type in the binary file ("uint16" or "uint32")
+        """
+        if not os.path.exists(bin_path):
+            raise FileNotFoundError(f"Binary file not found: {bin_path}")
+        
+        self.bin_path = bin_path
+        self.seq_len = seq_len
+        self.vocab_size = vocab_size
+        
+        # Map numpy dtype
+        if dtype == "uint16":
+            self.dtype = np.uint16
+        elif dtype == "uint32":
+            self.dtype = np.uint32
+        else:
+            raise ValueError(f"Unsupported dtype: {dtype}. Use 'uint16' or 'uint32'")
+        
+        # Memory-map the file
+        self.data = np.memmap(bin_path, dtype=self.dtype, mode='r')
+        
+        # Calculate number of samples
+        # We need seq_len + 1 tokens per sample (for input and shifted target)
+        self.num_samples = (len(self.data) - 1) // seq_len
+        
+        print(f"[MemmapTokenDataset] Loaded {len(self.data):,} tokens from {bin_path}")
+        print(f"[MemmapTokenDataset] {self.num_samples:,} samples of length {seq_len}")
+    
+    def __len__(self):
+        return self.num_samples
+    
+    def __getitem__(self, idx):
+        """
+        Returns (x, y) where y is x shifted by 1 position
+        """
+        start_idx = idx * self.seq_len
+        end_idx = start_idx + self.seq_len + 1
+        
+        # Extract tokens
+        tokens = self.data[start_idx:end_idx].astype(np.int64)
+        
+        # Validate token range
+        if tokens.max() >= self.vocab_size:
+            raise ValueError(f"Token {tokens.max()} exceeds vocab_size {self.vocab_size}")
+        
+        x = torch.from_numpy(tokens[:-1].copy())  # input: [0, seq_len-1]
+        y = torch.from_numpy(tokens[1:].copy())   # target: [1, seq_len]
+        
+        return x, y
 
-def build_fsdp(model: torch.nn.Module, use_bf16: bool, act_ckpt: bool):
-    mp = None
-    if use_bf16:
-        mp = MixedPrecision(
-            param_dtype=torch.bfloat16,
-            reduce_dtype=torch.bfloat16,
-            buffer_dtype=torch.bfloat16,
-        )
-    # FSDP 自动wrap 每个transformer Block
-    auto_wrap = transformer_auto_wrap_policy({Block})
 
-    fsdp = FSDP(
-        model,
-        auto_wrap_policy=auto_wrap,
-        sharding_strategy=ShardingStrategy.FULL_SHARD,
-        mixed_precision=mp,
-        backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
-        device_id=torch.cuda.current_device(),
-        limit_all_gathers=True,
-        use_orig_params=True,
-    )
-
-    if act_ckpt:
-        def check_fn(m):
-            return isinstance(m, Block)
-
-        apply_activation_checkpointing(
-            fsdp,
-            checkpoint_wrapper_fn=lambda m: checkpoint_wrapper(
-                m, checkpoint_impl=CheckpointImpl.NO_REENTRANT
-            ),
-            check_fn=check_fn,
-        )
-    return fsdp
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--preset", type=str, default="8m", choices=["8m", "100m", "300m"])
-    parser.add_argument("--seq_len", type=int, default=1024)
-    parser.add_argument("--vocab_size", type=int, default=50304)
-
-    parser.add_argument("--global_batch_tokens", type=int, default=2_097_152,
-                        help="全局每 step 的 token 数（= world_size * micro_bsz * seq_len * grad_accum）")
-    parser.add_argument("--micro_bsz", type=int, default=2, help="每 GPU micro batch size")
-    parser.add_argument("--grad_accum", type=int, default=8)
-
-    parser.add_argument("--steps", type=int, default=200)
-    parser.add_argument("--warmup", type=int, default=20)
-    parser.add_argument("--max_lr", type=float, default=3e-4)
-    parser.add_argument("--min_lr", type=float, default=3e-5)
-    parser.add_argument("--weight_decay", type=float, default=0.1)
-    parser.add_argument("--clip_grad", type=float, default=1.0)
-
-    parser.add_argument("--bf16", action="store_true")
-    parser.add_argument("--flash", action="store_true")
-    parser.add_argument("--act_ckpt", action="store_true")
-
-    parser.add_argument("--data", type=str, default="random", choices=["random", "memmap"])
-    parser.add_argument("--num_tokens", type=int, default=100_000_000, help="random 数据总 token 数")
-    parser.add_argument("--bin_path", type=str, default="", help="memmap: token.bin path")
-    parser.add_argument("--log_every", type=int, default=10)
-    args = parser.parse_args()
-
-    is_ddp, local_rank = setup_distributed()
-    device = torch.device("cuda", local_rank) if torch.cuda.is_available() else torch.device("cpu")
-
-    # Dataset / Loader
-    if args.data == "random":
-        ds = RandomTokenDataset(
-            num_tokens=args.num_tokens,
-            seq_len=args.seq_len,
-            vocab_size=args.vocab_size,
-            seed=1234+(dist.get_rank() if is_ddp else 0),
-        )
-    else:
-        ds = MemmapTokenDataset(args.bin_path, args.seq_len, args.vocab_size, dtype="uint16")
-
-    sampler = DistributedSampler(ds, shuffle=True) if is_ddp else None
-    dl = DataLoader(
-        ds,
-        batch_size=args.micro_bsz,
+def create_dataloader(dataset, batch_size, is_distributed=False, num_workers=2, pin_memory=True, drop_last=True):
+    """
+    Create a DataLoader with optional distributed sampling
+    
+    Args:
+        dataset: Dataset instance
+        batch_size: Batch size per GPU
+        is_distributed: Whether to use DistributedSampler
+        num_workers: Number of data loading workers
+        pin_memory: Whether to pin memory
+        drop_last: Whether to drop the last incomplete batch
+    
+    Returns:
+        DataLoader instance
+    """
+    sampler = None
+    shuffle = True
+    
+    if is_distributed:
+        sampler = DistributedSampler(dataset, shuffle=True)
+        shuffle = False  # Sampler handles shuffling
+    
+    dataloader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=batch_size,
         sampler=sampler,
-        shuffle=(sampler is None),
-        num_workers=2,
-        pin_memory=True,
-        drop_last=True,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        drop_last=drop_last,
     )
-    it = iter(dl)
+    
+    return dataloader
 
-    # Model
-    cfg = get_model_cfg(args.preset, args.vocab_size, args.seq_len, args.flash, args.act_ckpt)
-    model = TransformerLM(cfg).to(device)
-    if rank0():
-        print(f"[model] preset={args.preset} params={count_params(model)/1e6:.2f}M")
-
-    # FSDP
-    if is_ddp:
-        model = build_fsdp(model, use_bf16=args.bf16, act_ckpt=args.act_ckpt)
-
-    # Optim
-    # demo：AdamW，真实大训练可换 fused AdamW（依赖 apex/torch nightly/实现细节）
-    opt = torch.optim.AdamW(model.parameters(), lr=args.max_lr, betas=(0.9, 0.95), weight_decay=args.weight_decay)
-
-    scaler = None
-    use_amp = args.bf16 and torch.cuda.is_available()
-    amp_dtype = torch.bfloat16 if use_amp else None
-
-    # sanity: global batch tokens (用于做 batch/lr scaling)
-    world = dist.get_world_size() if is_ddp else 1
-    implied_tokens = world * args.micro_bsz * args.seq_len * args.grad_accum
-    if rank0():
-        print(f"[batch] world={world} micro_bsz={args.micro_bsz} seq_len={args.seq_len} "
-              f"grad_accum={args.grad_accum} => global_tokens/step={implied_tokens}")
-
-    meter = ThroughputMeter()
-    model.train()
-
-    for step in range(args.steps):
-        if sampler is not None:
-            sampler.set_epoch(step)
-
-        # lr schedule (cosine + warmup)
-        lr = cosine_lr(step, args.warmup, args.steps, args.max_lr, args.min_lr)
-        for pg in opt.param_groups:
-            pg["lr"] = lr
-
-        opt.zero_grad(set_to_none=True)
-
-        loss_accum = 0.0
-        for micro in range(args.grad_accum):
-            try:
-                x, y = next(it)
-            except StopIteration:
-                it = iter(dl)
-                x, y = next(it)
-
-            x = x.to(device, non_blocking=True)
-            y = y.to(device, non_blocking=True)
-
-            with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
-                _, loss = model(x, y)
-                loss = loss / args.grad_accum
-
-            loss.backward()
-            loss_accum += loss.detach().float()
-
-            meter.update(x.numel())
-
-        # grad clip (FSDP 下建议在root上clip; 这里用通用写法)
-        if args.clip_grad > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
-
-        opt.step()
-
-        # reduce loss for logging 
-        loss_mean = all_reduce_mean(loss_accum) if is_ddp else loss_accum
-        if rank0() and (step % args.log_every == 0 or step == args.steps - 1):
-            tps, dt = meter.get()
-            # 简单打印显存峰值
-            peak = torch.cuda.max_memory_allocated() / (1024**3) if torch.cuda.is_available() else 0.0
-            print(f"step {step:04d} | loss {loss_mean.item():.4f} | lr {lr:.2e} | "
-                  f"tok/s {tps:.0f} | peak_mem {peak:.2f} GB")
-
-        # reset peak stats periodically
-        if torch.cuda.is_available() and step % args.log_every == 0:
-            torch.cuda.reset_peak_memory_stats()
-
-    if is_ddp:
-        dist.destroy_process_group()
 
 if __name__ == "__main__":
-    main()
-
-
-
-
-
+    # Test RandomTokenDataset
+    print("Testing RandomTokenDataset...")
+    ds = RandomTokenDataset(num_tokens=100000, seq_len=128, vocab_size=50000, seed=42)
+    print(f"Dataset length: {len(ds)}")
+    
+    x, y = ds[0]
+    print(f"Sample shape: x={x.shape}, y={y.shape}")
+    print(f"x[:10] = {x[:10]}")
+    print(f"y[:10] = {y[:10]}")
+    
+    # Verify y is x shifted by 1
+    x2, y2 = ds[0]
+    assert torch.all(x[1:] == y[:-1]), "y should be x shifted by 1"
+    print("✓ RandomTokenDataset test passed")

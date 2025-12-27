@@ -18,7 +18,7 @@ def all_reduce_mean(x: torch.Tensor):
     return y
 
 def count_params(model: torch.nn.Module):
-    return sum(p.nummel() for p in model.parameters())
+    return sum(p.numel() for p in model.parameters())
 
 
 class ThroughputMeter:

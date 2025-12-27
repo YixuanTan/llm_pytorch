@@ -58,13 +58,13 @@ class CausalSelfAttention(nn.Module):
                 is_causal=True,
             ) # [B, nh, T, dh]
         else:
-            att = (q @ k.tranpose(-2, -1)) / math.sqrt(self.d_head)  # [B, nh, T, T]
+            att = (q @ k.transpose(-2, -1)) / math.sqrt(self.d_head)  # [B, nh, T, T]
             mask = torch.tril(torch.ones(T, T, device=x.device, dtype=torch.bool))
             att = att.masked_fill(~mask, float("-inf"))
             att = F.softmax(att, dim=-1)
             y = att @ v
         
-        y = y.tranpose(1, 2).contiguous().view(B, T, C)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.proj(y)
 
 class MLP(nn.Module):
