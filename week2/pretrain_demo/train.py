@@ -113,6 +113,11 @@ def main():
     parser.add_argument("--num_tokens", type=int, default=100_000_000, help="random 数据总 token 数")
     parser.add_argument("--bin_path", type=str, default="", help="memmap: token.bin path")
     parser.add_argument("--log_every", type=int, default=10)
+    
+    # Profiling arguments
+    parser.add_argument("--profile", action="store_true", help="启用 nsys profiling")
+    parser.add_argument("--profile_start_step", type=int, default=10, help="开始 profiling 的 step")
+    parser.add_argument("--profile_end_step", type=int, default=15, help="结束 profiling 的 step")
     args = parser.parse_args()
 
     is_ddp, local_rank = setup_distributed()
@@ -168,8 +173,23 @@ def main():
 
     meter = ThroughputMeter()
     model.train()
+    
+    # nsys profiling setup
+    if args.profile and rank0():
+        print(f"[profiling] enabled from step {args.profile_start_step} to {args.profile_end_step}")
 
     for step in range(args.steps):
+        # nsys profiling range markers using CUDA Profiler API
+        if args.profile and torch.cuda.is_available():
+            if step == args.profile_start_step:
+                torch.cuda.cudart().cudaProfilerStart()
+                if rank0():
+                    print(f"[profiling] started at step {step}")
+            elif step == args.profile_end_step:
+                torch.cuda.cudart().cudaProfilerStop()
+                if rank0():
+                    print(f"[profiling] stopped at step {step}")
+        
         if sampler is not None:
             sampler.set_epoch(step)
 
@@ -181,6 +201,11 @@ def main():
         opt.zero_grad(set_to_none=True)
 
         loss_accum = 0.0
+        
+        # Mark training iteration for profiler
+        if args.profile and torch.cuda.is_available():
+            torch.cuda.nvtx.range_push(f"step_{step}")
+        
         for micro in range(args.grad_accum):
             try:
                 x, y = next(it)
@@ -191,6 +216,10 @@ def main():
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
 
+            # Mark forward/backward pass
+            if args.profile and torch.cuda.is_available():
+                torch.cuda.nvtx.range_push(f"micro_{micro}")
+            
             with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
                 _, loss = model(x, y)
                 loss = loss / args.grad_accum
@@ -199,12 +228,18 @@ def main():
             loss_accum += loss.detach().float()
 
             meter.update(x.numel())
+            
+            if args.profile and torch.cuda.is_available():
+                torch.cuda.nvtx.range_pop()
 
         # grad clip (FSDP 下建议在root上clip; 这里用通用写法)
         if args.clip_grad > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
 
         opt.step()
+        
+        if args.profile and torch.cuda.is_available():
+            torch.cuda.nvtx.range_pop()
 
         # reduce loss for logging 
         loss_mean = all_reduce_mean(loss_accum) if is_ddp else loss_accum
